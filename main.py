@@ -65,8 +65,12 @@ SOUND_NAMES = [
 
 TILE_MODES = ["Unhinged"]
 
-_UNHINGED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "audio", "unhinged")
+_UNHINGED_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "audio", "unhinged")
+_UNHINGED_RUN   = os.path.join(_UNHINGED_DIR, "unhinged_run")
+_UNHINGED_ATPA  = os.path.join(_UNHINGED_DIR, "unhinged_atpa")
+_UNHINGED_DPA   = os.path.join(_UNHINGED_DIR, "unhinged_dpa")
+_UNHINGED_ATRES = os.path.join(_UNHINGED_DIR, "unhinged_atres")
 
 
 class ShuffleBag:
@@ -82,21 +86,29 @@ class ShuffleBag:
         return self._bag.pop()
 
 
+_audio_lock = threading.Lock()
+
+
 def play_audio_file(path: str) -> None:
-    """Play an audio file via mpv, ffplay, or paplay — whichever is available."""
+    """Play an audio file; silently skips if another clip is already playing."""
     def _play():
-        for cmd in (
-            ["mpv", "--no-terminal", "--really-quiet", path],
-            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path],
-            ["paplay", path],
-            ["aplay", path],
-        ):
-            try:
-                subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
-                break
-            except FileNotFoundError:
-                continue
+        if not _audio_lock.acquire(blocking=False):
+            return
+        try:
+            for cmd in (
+                ["mpv", "--no-terminal", "--really-quiet", path],
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path],
+                ["paplay", path],
+                ["aplay", path],
+            ):
+                try:
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                    break
+                except FileNotFoundError:
+                    continue
+        finally:
+            _audio_lock.release()
     threading.Thread(target=_play, daemon=True).start()
 
 
@@ -603,8 +615,9 @@ class TimerTile:
         self._colorable    = []
 
         self.active_modes        = set()
-        self._unhinged_bag       = None
-        self._unhinged_after_id  = None
+        self._unhinged_bags      = {}    # dir -> ShuffleBag, lazy
+        self._unhinged_run_id    = None  # after() ID for run intervals
+        self._unhinged_dpa_id    = None  # after() ID for pause intervals
         self.icon_close   = None
         self.icon_pin_on  = None
         self.icon_pin_off = None
@@ -772,14 +785,17 @@ class TimerTile:
         if enabled:
             self.active_modes.add(mode)
             if mode == "Unhinged":
-                self._unhinged_bag = None   # fresh shuffle on enable
-                if self.running and not self.finished:
-                    self._unhinged_start()
+                self._unhinged_bags.clear()
+                if not self.finished:
+                    if self.running:
+                        self._unhinged_run_start()
+                    else:
+                        self._unhinged_dpa_start()
         else:
             self.active_modes.discard(mode)
             if mode == "Unhinged":
                 self._unhinged_stop()
-                self._unhinged_bag = None
+                self._unhinged_bags.clear()
         # Refresh bolt icon color
         tc = text_color(self.color)
         bolt_fg = "#FFD93D" if self.active_modes else tc
@@ -788,34 +804,66 @@ class TimerTile:
         self.btn_mode.config(image=self.icon_mode, activebackground=abg)
 
     # ── Unhinged mode audio ───────────────────────────────────────────────────
-    def _unhinged_start(self) -> None:
-        """Begin scheduling random unhinged audio clips."""
-        self._unhinged_stop()
-        if self._unhinged_bag is None:
-            files = sorted(glob.glob(os.path.join(_UNHINGED_DIR, "*.mp3")))
+    def _ubag(self, d: str):
+        """Return lazily created ShuffleBag for directory d, or None if empty."""
+        if d not in self._unhinged_bags:
+            files = sorted(glob.glob(os.path.join(d, "*.mp3")))
             if not files:
-                return
-            self._unhinged_bag = ShuffleBag(files)
-        self._unhinged_schedule()
+                return None
+            self._unhinged_bags[d] = ShuffleBag(files)
+        return self._unhinged_bags[d]
 
-    def _unhinged_stop(self) -> None:
-        if self._unhinged_after_id is not None:
+    def _uplay(self, d: str) -> None:
+        bag = self._ubag(d)
+        if bag:
+            play_audio_file(bag.next())
+
+    # ── run scheduler (while timer is running) ────────────────────────────────
+    def _unhinged_run_start(self) -> None:
+        self._unhinged_run_stop()
+        delay_ms = random.randint(300_000, 600_000)
+        self._unhinged_run_id = self.win.after(delay_ms, self._unhinged_run_play)
+
+    def _unhinged_run_stop(self) -> None:
+        if self._unhinged_run_id is not None:
             try:
-                self.win.after_cancel(self._unhinged_after_id)
+                self.win.after_cancel(self._unhinged_run_id)
             except tk.TclError:
                 pass
-            self._unhinged_after_id = None
+            self._unhinged_run_id = None
 
-    def _unhinged_schedule(self) -> None:
-        delay_ms = random.randint(300_000, 600_000)
-        self._unhinged_after_id = self.win.after(delay_ms, self._unhinged_play)
-
-    def _unhinged_play(self) -> None:
-        self._unhinged_after_id = None
+    def _unhinged_run_play(self) -> None:
+        self._unhinged_run_id = None
         if not self.win.winfo_exists() or not self.running:
             return
-        play_audio_file(self._unhinged_bag.next())
-        self._unhinged_schedule()
+        self._uplay(_UNHINGED_RUN)
+        self._unhinged_run_start()
+
+    # ── dpa scheduler (while timer is paused) ─────────────────────────────────
+    def _unhinged_dpa_start(self) -> None:
+        self._unhinged_dpa_stop()
+        delay_ms = random.randint(240_000, 480_000)   # 4–8 min
+        self._unhinged_dpa_id = self.win.after(delay_ms, self._unhinged_dpa_play)
+
+    def _unhinged_dpa_stop(self) -> None:
+        if self._unhinged_dpa_id is not None:
+            try:
+                self.win.after_cancel(self._unhinged_dpa_id)
+            except tk.TclError:
+                pass
+            self._unhinged_dpa_id = None
+
+    def _unhinged_dpa_play(self) -> None:
+        self._unhinged_dpa_id = None
+        if not self.win.winfo_exists():
+            return
+        self._uplay(_UNHINGED_DPA)
+        self._unhinged_dpa_start()
+
+    def _unhinged_stop(self) -> None:
+        """Stop all unhinged schedulers."""
+        self._unhinged_run_stop()
+        self._unhinged_dpa_stop()
 
     # ── Color picker ──────────────────────────────────────────────────────────
     def _pick_color(self) -> None:
@@ -861,22 +909,29 @@ class TimerTile:
             self._apply_color(self.color)
             self._notify_tick()
             if "Unhinged" in self.active_modes:
-                self._unhinged_bag = None
-                self._unhinged_start()
+                self._unhinged_bags.clear()
+                self._unhinged_run_start()
             return
         self.running = not self.running
         tc     = text_color(self.color)
         btn_bg = darken(self.color)
         abg    = darken(btn_bg, 0.10)
         if self.running:
+            # ── Resumed ──────────────────────────────────────────────────────
             self.btn_pause.config(image=self.icon_pause, text=" Pause",
                                   bg=btn_bg, fg=tc, activebackground=abg)
             if "Unhinged" in self.active_modes:
-                self._unhinged_start()
+                self._unhinged_dpa_stop()
+                self._uplay(_UNHINGED_ATRES)
+                self._unhinged_run_start()
         else:
+            # ── Paused ───────────────────────────────────────────────────────
             self.btn_pause.config(image=self.icon_play,  text=" Resume",
                                   bg=btn_bg, fg=tc, activebackground=abg)
-            self._unhinged_stop()
+            if "Unhinged" in self.active_modes:
+                self._unhinged_run_stop()
+                self._uplay(_UNHINGED_ATPA)
+                self._unhinged_dpa_start()
         self._notify_tick()
 
     def _toggle_pin(self):
