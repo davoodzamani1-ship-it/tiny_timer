@@ -322,7 +322,7 @@ def format_time(seconds: int) -> str:
     s = max(0, seconds)
     h, rem = divmod(s, 3600)
     m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
 # ── Color swatch popup ────────────────────────────────────────────────────────
@@ -454,7 +454,8 @@ class TimerTile:
         self.lbl_time = tk.Label(
             win, textvariable=self.time_var,
             bg=self.color, fg=tc,
-            font=(_FONT_UI, 44, "bold"), cursor="fleur",
+            font=(_FONT_UI, self._time_font_size(self.remaining), "bold"),
+            cursor="fleur",
         )
         self.lbl_time.pack(expand=True)
         self._colorable.append(self.lbl_time)
@@ -547,6 +548,15 @@ class TimerTile:
         self._apply_color(self.color)
         self._notify_tick()
 
+    # ── Time display helpers ───────────────────────────────────────────────────
+    @staticmethod
+    def _time_font_size(seconds: int) -> int:
+        return 32 if seconds >= 3600 else 44
+
+    def _update_display(self, seconds: int) -> None:
+        self.time_var.set(format_time(seconds))
+        self.lbl_time.configure(font=(_FONT_UI, self._time_font_size(seconds), "bold"))
+
     # ── Drag ──────────────────────────────────────────────────────────────────
     def _drag_start(self, e):
         # Ignore clicks that originate from buttons — let the button handle them
@@ -566,7 +576,7 @@ class TimerTile:
             self.remaining = self.total_seconds
             self.finished  = False
             self.running   = True
-            self.time_var.set(format_time(self.remaining))
+            self._update_display(self.remaining)
             self._apply_color(self.color)
             self._notify_tick()
             return
@@ -599,7 +609,7 @@ class TimerTile:
             return
         if self.running and self.remaining > 0:
             self.remaining -= 1
-            self.time_var.set(format_time(self.remaining))
+            self._update_display(self.remaining)
             if self.remaining == 0:
                 self.finished = True
                 self._on_finish()
@@ -850,7 +860,7 @@ class ControlPanel:
         time_lbl = tk.Label(
             row, text=format_time(self.tiles[tile_id].remaining),
             bg=PANEL_BG, fg=PANEL_ACC,
-            font=(_FONT_MONO, 9), width=5, anchor="e",
+            font=(_FONT_MONO, 9), width=8, anchor="e",
         )
         time_lbl.pack(side="right", padx=(2, 4))
 
