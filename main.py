@@ -247,6 +247,12 @@ def _di_add(d, S, fg):
     _rl(d, m, cy, S - m, cy, fg, w)
 
 
+def _di_check(d, S, fg):
+    w = max(3, int(S * 0.09))
+    _rl(d, int(S*0.12), int(S*0.52), int(S*0.40), int(S*0.80), fg, w)
+    _rl(d, int(S*0.40), int(S*0.80), int(S*0.88), int(S*0.18), fg, w)
+
+
 def _di_hourglass(d, S, fg):
     m   = int(S * 0.12)
     mid = S // 2
@@ -836,8 +842,11 @@ class ControlPanel:
         dot.pack_propagate(False)
         dot.pack(side="left", padx=(0, 8), pady=4)
 
-        tk.Label(row, text=name, bg=PANEL_BG, fg=PANEL_FG,
-                 font=(_FONT_UI, 9), anchor="w").pack(side="left")
+        name_lbl = tk.Label(row, text=name, bg=PANEL_BG, fg=PANEL_FG,
+                            font=(_FONT_UI, 9), anchor="w", cursor="xterm")
+        name_lbl.pack(side="left")
+        name_lbl.bind("<Double-Button-1>",
+                      lambda e, tid=tile_id: self._start_rename(tid))
 
         close_btn = tk.Button(
             row, image=self._row_icon_close, text="",
@@ -867,8 +876,88 @@ class ControlPanel:
         self._rows[tile_id] = {
             "frame": row, "dot": dot,
             "time_lbl": time_lbl, "pause_btn": pause_btn,
+            "name_lbl": name_lbl,
         }
         self._refresh_list_visibility()
+
+    def _start_rename(self, tile_id: int):
+        row_data = self._rows.get(tile_id)
+        if not row_data:
+            return
+        name_lbl = row_data["name_lbl"]
+        # If an edit is already active on this row, do nothing
+        if row_data.get("_editing"):
+            return
+        row_data["_editing"] = True
+        name_lbl.pack_forget()
+        row_data["time_lbl"].pack_forget()   # reclaim space for the entry
+
+        # Container styled as the input box — entry + checkmark live inside it
+        box = tk.Frame(
+            row_data["frame"],
+            bg="#1e2845",
+            highlightthickness=1,
+            highlightbackground="#2d3555",
+            highlightcolor=PANEL_ACC,
+        )
+        box.pack(side="left")
+
+        entry = tk.Entry(
+            box,
+            font=(_FONT_UI, 9), width=9,
+            bg="#1e2845", fg=PANEL_FG,
+            insertbackground=PANEL_FG,
+            relief="flat", bd=0,
+            highlightthickness=0,
+        )
+        entry.insert(0, name_lbl.cget("text"))
+        entry.select_range(0, "end")
+        entry.pack(side="left", padx=(4, 0), pady=1)
+
+        check_icon = make_icon(_di_check, 12, PANEL_ACC)
+        check_btn = tk.Button(
+            box, image=check_icon, text="",
+            bg="#1e2845", relief="flat", cursor="hand2",
+            borderwidth=0, highlightthickness=0,
+            padx=3, pady=1,
+            activebackground="#2a3a5e",
+        )
+        check_btn._icon = check_icon   # prevent GC
+        check_btn.pack(side="left", padx=(2, 3))
+
+        edit_widgets = [box]
+        _done = [False]
+
+        def confirm(*_):
+            if _done[0]:
+                return
+            _done[0] = True
+            self._confirm_rename(tile_id, entry.get(), edit_widgets)
+
+        entry.bind("<Return>", confirm)
+        entry.bind("<FocusOut>", confirm)
+        entry.bind("<Escape>", lambda e: confirm())
+        check_btn.config(command=confirm)
+        entry.focus_set()
+
+    def _confirm_rename(self, tile_id: int, new_name: str, edit_widgets: list):
+        row_data = self._rows.get(tile_id)
+        if not row_data:
+            return
+        new_name = new_name.strip() or row_data["name_lbl"].cget("text")
+        for w in edit_widgets:
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        row_data["name_lbl"].config(text=new_name)
+        row_data["name_lbl"].pack(side="left")
+        row_data["time_lbl"].pack(side="right", padx=(2, 4))
+        row_data["_editing"] = False
+        # Sync to the tile's own name label
+        tile = self.tiles.get(tile_id)
+        if tile and tile.win.winfo_exists():
+            tile.lbl_name.config(text=new_name)
 
     def _on_tile_tick(self, tile_id: int, remaining: int,
                       running: bool, finished: bool, color: str):
