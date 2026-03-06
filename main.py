@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Tiny Timer — multiple floating timer tiles."""
 
+import glob
 import math
 import os
+import random
 import struct
 import subprocess
 import tempfile
@@ -60,6 +62,42 @@ SOUND_NAMES = [
     "Marimba", "Soft Ping",
     "Wind Chime", "Wind Chime ×2",
 ]
+
+TILE_MODES = ["Unhinged"]
+
+_UNHINGED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "audio", "unhinged")
+
+
+class ShuffleBag:
+    """Exhausts all items in random order before repeating."""
+    def __init__(self, items):
+        self._items = list(items)
+        self._bag: list = []
+
+    def next(self):
+        if not self._bag:
+            self._bag = list(self._items)
+            random.shuffle(self._bag)
+        return self._bag.pop()
+
+
+def play_audio_file(path: str) -> None:
+    """Play an audio file via mpv, ffplay, or paplay — whichever is available."""
+    def _play():
+        for cmd in (
+            ["mpv", "--no-terminal", "--really-quiet", path],
+            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path],
+            ["paplay", path],
+            ["aplay", path],
+        ):
+            try:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                break
+            except FileNotFoundError:
+                continue
+    threading.Thread(target=_play, daemon=True).start()
 
 
 def _sound_repeat(base: list, count: int, gap_ms: int = 340) -> list:
@@ -253,6 +291,19 @@ def _di_check(d, S, fg):
     _rl(d, int(S*0.40), int(S*0.80), int(S*0.88), int(S*0.18), fg, w)
 
 
+def _di_bolt(d, S, fg):
+    """Lightning bolt / mode indicator icon."""
+    pts = [
+        (int(S * 0.58), int(S * 0.04)),
+        (int(S * 0.18), int(S * 0.54)),
+        (int(S * 0.46), int(S * 0.54)),
+        (int(S * 0.42), int(S * 0.96)),
+        (int(S * 0.82), int(S * 0.46)),
+        (int(S * 0.54), int(S * 0.46)),
+    ]
+    d.polygon(pts, fill=fg)
+
+
 def _di_hourglass(d, S, fg):
     m   = int(S * 0.12)
     mid = S // 2
@@ -324,11 +375,94 @@ def parse_duration(text: str):
     return None
 
 
+def _bind_entry_keys(entry: tk.Entry) -> None:
+    """Fix Ctrl+A (select all) and Ctrl+V (replace selection) for tk.Entry on Linux."""
+    def _select_all(e):
+        entry.select_range(0, "end")
+        entry.icursor("end")
+        return "break"
+
+    def _paste_replace(e):
+        try:
+            start = entry.index("sel.first")
+            end   = entry.index("sel.last")
+            entry.delete(start, end)
+        except tk.TclError:
+            pass
+        try:
+            entry.insert("insert", entry.clipboard_get())
+        except tk.TclError:
+            pass
+        return "break"
+
+    entry.bind("<Control-a>", _select_all)
+    entry.bind("<Control-v>", _paste_replace)
+
+
 def format_time(seconds: int) -> str:
     s = max(0, seconds)
     h, rem = divmod(s, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+# ── Tooltip ───────────────────────────────────────────────────────────────────
+class Tooltip:
+    """Shows a small label below a widget after a short hover delay."""
+    _DELAY = 600   # ms before appearing
+
+    def __init__(self, widget, text: str):
+        self._widget   = widget
+        self._text     = text
+        self._after_id = None
+        self._tip      = None
+        widget.bind("<Enter>",       self._schedule, add="+")
+        widget.bind("<Leave>",       self._hide,     add="+")
+        widget.bind("<ButtonPress>", self._hide,     add="+")
+
+    def update_text(self, text: str):
+        self._text = text
+        if self._tip:
+            try:
+                self._tip.winfo_children()[0].configure(text=text)
+            except (tk.TclError, IndexError):
+                pass
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        self._after_id = self._widget.after(self._DELAY, self._show)
+
+    def _cancel(self):
+        if self._after_id is not None:
+            self._widget.after_cancel(self._after_id)
+            self._after_id = None
+
+    def _show(self):
+        if self._tip or not self._widget.winfo_exists():
+            return
+        tip = tk.Toplevel(self._widget)
+        tip.overrideredirect(True)
+        tip.wm_attributes("-topmost", True)
+        tk.Label(
+            tip, text=self._text,
+            bg="#1a1a2e", fg="#cccccc",
+            font=(_FONT_UI, 8),
+            padx=7, pady=3,
+        ).pack()
+        tip.update_idletasks()
+        cx = self._widget.winfo_rootx() + self._widget.winfo_width() // 2
+        cy = self._widget.winfo_rooty() + self._widget.winfo_height() + 5
+        tip.geometry(f"+{cx - tip.winfo_width() // 2}+{cy}")
+        self._tip = tip
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self._tip:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
 
 
 # ── Color swatch popup ────────────────────────────────────────────────────────
@@ -364,14 +498,84 @@ class ColorSwatchPopup:
         py = anchor.winfo_rooty() + anchor.winfo_height() + 2
         popup.geometry(f"+{px}+{py}")
 
-        popup.bind("<Escape>", lambda e: popup.destroy())
+        popup.bind("<Escape>", lambda e: self._dismiss())
         popup.grab_set()
         popup.focus_set()
 
+        def _on_click(e):
+            wx, wy = popup.winfo_rootx(), popup.winfo_rooty()
+            ww, wh = popup.winfo_width(), popup.winfo_height()
+            if not (wx <= e.x_root < wx + ww and wy <= e.y_root < wy + wh):
+                self._dismiss()
+        popup.bind("<Button-1>", _on_click)
+
+    def _dismiss(self):
+        try:
+            self._popup.grab_release()
+            self._popup.destroy()
+        except tk.TclError:
+            pass
+
     def _pick(self, color: str):
-        self._popup.grab_release()
-        self._popup.destroy()
+        try:
+            self._popup.grab_release()
+            self._popup.destroy()
+        except tk.TclError:
+            pass
         self._cb(color)
+
+
+# ── Mode popup ────────────────────────────────────────────────────────────────
+class ModePopup:
+    def __init__(self, parent, anchor, active_modes, on_toggle):
+        self._on_toggle = on_toggle
+
+        popup = tk.Toplevel(parent)
+        popup.overrideredirect(True)
+        popup.configure(bg="#2a3052")
+        popup.wm_attributes("-topmost", True)
+        self._popup = popup
+
+        inner = tk.Frame(popup, bg=PANEL_BG, padx=10, pady=8)
+        inner.pack(padx=1, pady=1)
+
+        tk.Label(inner, text="Timer Modes", bg=PANEL_BG, fg="#8899bb",
+                 font=(_FONT_UI, 8)).pack(anchor="w", pady=(0, 4))
+
+        for mode in TILE_MODES:
+            var = tk.BooleanVar(value=(mode in active_modes))
+            cb = tk.Checkbutton(
+                inner, text=mode, variable=var,
+                bg=PANEL_BG, fg=PANEL_FG,
+                selectcolor="#2d2d4e",
+                activebackground=PANEL_BG, activeforeground=PANEL_FG,
+                font=(_FONT_UI, 10), cursor="hand2",
+                command=lambda m=mode, v=var: on_toggle(m, v.get()),
+            )
+            cb.pack(anchor="w")
+
+        popup.update_idletasks()
+        px = anchor.winfo_rootx()
+        py = anchor.winfo_rooty() + anchor.winfo_height() + 2
+        popup.geometry(f"+{px}+{py}")
+
+        popup.grab_set()
+        popup.focus_set()
+
+        def _dismiss():
+            try:
+                popup.grab_release()
+                popup.destroy()
+            except tk.TclError:
+                pass
+
+        def _on_click(e):
+            wx, wy = popup.winfo_rootx(), popup.winfo_rooty()
+            ww, wh = popup.winfo_width(), popup.winfo_height()
+            if not (wx <= e.x_root < wx + ww and wy <= e.y_root < wy + wh):
+                _dismiss()
+        popup.bind("<Button-1>", _on_click)
+        popup.bind("<Escape>", lambda e: _dismiss())
 
 
 # ── Timer Tile ────────────────────────────────────────────────────────────────
@@ -395,8 +599,12 @@ class TimerTile:
         self.sound         = _settings["default_sound"]
         self._drag_ox      = 0
         self._drag_oy      = 0
+        self._dragging     = False
         self._colorable    = []
 
+        self.active_modes        = set()
+        self._unhinged_bag       = None
+        self._unhinged_after_id  = None
         self.icon_close   = None
         self.icon_pin_on  = None
         self.icon_pin_off = None
@@ -404,6 +612,7 @@ class TimerTile:
         self.icon_play    = None
         self.icon_note    = None
         self.icon_swatch  = None
+        self.icon_mode    = None
 
         self._build(x, y)
         self._tick()
@@ -450,10 +659,11 @@ class TimerTile:
             self._colorable.append(b)
             return b
 
-        self.btn_close = _icon_btn(top, self._close);           self.btn_close.pack(side="right")
-        self.btn_pin   = _icon_btn(top, self._toggle_pin);      self.btn_pin.pack(side="right")
-        self.btn_sound = _icon_btn(top, self._show_sound_menu); self.btn_sound.pack(side="right")
-        self.btn_color = _icon_btn(top, self._pick_color);      self.btn_color.pack(side="right")
+        self.btn_close = _icon_btn(top, self._close);             self.btn_close.pack(side="right")
+        self.btn_pin   = _icon_btn(top, self._toggle_pin);        self.btn_pin.pack(side="right")
+        self.btn_sound = _icon_btn(top, self._show_sound_menu);   self.btn_sound.pack(side="right")
+        self.btn_mode  = _icon_btn(top, self._show_mode_popup);   self.btn_mode.pack(side="right")
+        self.btn_color = _icon_btn(top, self._pick_color);        self.btn_color.pack(side="right")
 
         # Time display ─────────────────────────────────────────────────────
         self.time_var = tk.StringVar(value=format_time(self.remaining))
@@ -481,10 +691,17 @@ class TimerTile:
         self.btn_pause.pack(fill="x")
 
         for w in (win, self.lbl_time, self.lbl_name):
-            w.bind("<Button-1>",  self._drag_start)
-            w.bind("<B1-Motion>", self._drag_move)
+            w.bind("<Button-1>",        self._drag_start)
+            w.bind("<B1-Motion>",       self._drag_move)
+            w.bind("<ButtonRelease-1>", self._drag_end)
 
         self._rebuild_icons(tc, self.color)
+
+        self._tip_close = Tooltip(self.btn_close, "Close")
+        self._tip_pin   = Tooltip(self.btn_pin,   "Pin on top")
+        self._tip_sound = Tooltip(self.btn_sound, "Sound effect")
+        self._tip_mode  = Tooltip(self.btn_mode,  "Timer mode")
+        self._tip_color = Tooltip(self.btn_color, "Tile color")
 
     # ── Icon factory ──────────────────────────────────────────────────────────
     def _rebuild_icons(self, fg: str, tile_bg: str) -> None:
@@ -503,6 +720,9 @@ class TimerTile:
         self.icon_play    = make_icon(_di_play,    psz, fg)
         self.icon_note    = make_icon(_di_note,    sz,  fg)
         self.icon_swatch  = make_icon(_di_swatch,  sz,  fg)
+        # Bolt: yellow when any mode is active, normal fg otherwise
+        bolt_fg = "#FFD93D" if self.active_modes else fg
+        self.icon_mode = make_icon(_di_bolt, sz, bolt_fg)
 
         self.btn_close.config(image=self.icon_close,
                               activebackground=abg, activeforeground=fg)
@@ -512,6 +732,8 @@ class TimerTile:
         )
         self.btn_sound.config(image=self.icon_note,
                               activebackground=abg, activeforeground=fg)
+        self.btn_mode.config(image=self.icon_mode,
+                             activebackground=abg, activeforeground=fg)
         self.btn_color.config(image=self.icon_swatch,
                               activebackground=abg, activeforeground=fg)
 
@@ -537,13 +759,63 @@ class TimerTile:
             label = ("  " if sname != self.sound else "> ") + sname
             menu.add_command(label=label, command=lambda s=sname: self._set_sound(s))
         btn = self.btn_sound
-        try:
-            menu.tk_popup(btn.winfo_rootx(), btn.winfo_rooty() + btn.winfo_height(), 0)
-        finally:
-            menu.grab_release()
+        menu.tk_popup(btn.winfo_rootx(), btn.winfo_rooty() + btn.winfo_height())
 
     def _set_sound(self, name: str) -> None:
         self.sound = name
+
+    # ── Mode popup ────────────────────────────────────────────────────────────
+    def _show_mode_popup(self) -> None:
+        ModePopup(self.win, self.btn_mode, self.active_modes, self._on_mode_toggle)
+
+    def _on_mode_toggle(self, mode: str, enabled: bool) -> None:
+        if enabled:
+            self.active_modes.add(mode)
+            if mode == "Unhinged":
+                self._unhinged_bag = None   # fresh shuffle on enable
+                if self.running and not self.finished:
+                    self._unhinged_start()
+        else:
+            self.active_modes.discard(mode)
+            if mode == "Unhinged":
+                self._unhinged_stop()
+                self._unhinged_bag = None
+        # Refresh bolt icon color
+        tc = text_color(self.color)
+        bolt_fg = "#FFD93D" if self.active_modes else tc
+        self.icon_mode = make_icon(_di_bolt, self._ICON_SIZE, bolt_fg)
+        abg = darken(self.color, 0.10)
+        self.btn_mode.config(image=self.icon_mode, activebackground=abg)
+
+    # ── Unhinged mode audio ───────────────────────────────────────────────────
+    def _unhinged_start(self) -> None:
+        """Begin scheduling random unhinged audio clips."""
+        self._unhinged_stop()
+        if self._unhinged_bag is None:
+            files = sorted(glob.glob(os.path.join(_UNHINGED_DIR, "*.mp3")))
+            if not files:
+                return
+            self._unhinged_bag = ShuffleBag(files)
+        self._unhinged_schedule()
+
+    def _unhinged_stop(self) -> None:
+        if self._unhinged_after_id is not None:
+            try:
+                self.win.after_cancel(self._unhinged_after_id)
+            except tk.TclError:
+                pass
+            self._unhinged_after_id = None
+
+    def _unhinged_schedule(self) -> None:
+        delay_ms = random.randint(300_000, 600_000)
+        self._unhinged_after_id = self.win.after(delay_ms, self._unhinged_play)
+
+    def _unhinged_play(self) -> None:
+        self._unhinged_after_id = None
+        if not self.win.winfo_exists() or not self.running:
+            return
+        play_audio_file(self._unhinged_bag.next())
+        self._unhinged_schedule()
 
     # ── Color picker ──────────────────────────────────────────────────────────
     def _pick_color(self) -> None:
@@ -565,16 +837,19 @@ class TimerTile:
 
     # ── Drag ──────────────────────────────────────────────────────────────────
     def _drag_start(self, e):
-        # Ignore clicks that originate from buttons — let the button handle them
         if isinstance(e.widget, tk.Button):
             return
-        self._drag_ox = e.x_root - self.win.winfo_x()
-        self._drag_oy = e.y_root - self.win.winfo_y()
+        self._dragging = True
+        self._drag_ox  = e.x_root - self.win.winfo_x()
+        self._drag_oy  = e.y_root - self.win.winfo_y()
 
     def _drag_move(self, e):
-        if isinstance(e.widget, tk.Button):
+        if not self._dragging or isinstance(e.widget, tk.Button):
             return
         self.win.geometry(f"+{e.x_root - self._drag_ox}+{e.y_root - self._drag_oy}")
+
+    def _drag_end(self, _e=None):
+        self._dragging = False
 
     # ── Controls ──────────────────────────────────────────────────────────────
     def _toggle_pause(self):
@@ -585,6 +860,9 @@ class TimerTile:
             self._update_display(self.remaining)
             self._apply_color(self.color)
             self._notify_tick()
+            if "Unhinged" in self.active_modes:
+                self._unhinged_bag = None
+                self._unhinged_start()
             return
         self.running = not self.running
         tc     = text_color(self.color)
@@ -593,18 +871,23 @@ class TimerTile:
         if self.running:
             self.btn_pause.config(image=self.icon_pause, text=" Pause",
                                   bg=btn_bg, fg=tc, activebackground=abg)
+            if "Unhinged" in self.active_modes:
+                self._unhinged_start()
         else:
             self.btn_pause.config(image=self.icon_play,  text=" Resume",
                                   bg=btn_bg, fg=tc, activebackground=abg)
+            self._unhinged_stop()
         self._notify_tick()
 
     def _toggle_pin(self):
         self.pinned = not self.pinned
         self.win.wm_attributes("-topmost", self.pinned)
         self.btn_pin.config(image=self.icon_pin_on if self.pinned else self.icon_pin_off)
+        self._tip_pin.update_text("Unpin" if self.pinned else "Pin on top")
 
     def _close(self):
         self.running = False
+        self._unhinged_stop()
         if self.win.winfo_exists():
             self.win.destroy()
         self.on_close(self.tile_id)
@@ -624,6 +907,7 @@ class TimerTile:
 
     def _on_finish(self):
         self.running = False
+        self._unhinged_stop()
         play_sound(self.sound)
         self._flash(8)
 
@@ -782,13 +1066,15 @@ class ControlPanel:
             bg=PANEL_BG, fg=PANEL_FG, font=(_FONT_UI, 12, "bold"),
         ).pack(side="left")
 
-        tk.Button(
+        gear_btn = tk.Button(
             hdr, image=self._icon_gear, text="",
             bg=PANEL_BG, relief="flat", cursor="hand2",
             command=self._open_settings,
             borderwidth=0, highlightthickness=0, padx=2, pady=2,
             activebackground="#1e2845",
-        ).pack(side="right")
+        )
+        gear_btn.pack(side="right")
+        self._tip_gear = Tooltip(gear_btn, "Settings")
 
         # ── Add Timer — full width ─────────────────────────────────────────
         tk.Button(
@@ -912,6 +1198,7 @@ class ControlPanel:
         )
         entry.insert(0, name_lbl.cget("text"))
         entry.select_range(0, "end")
+        entry.icursor("end")
         entry.pack(side="left", padx=(4, 0), pady=1)
 
         check_icon = make_icon(_di_check, 12, PANEL_ACC)
@@ -934,7 +1221,9 @@ class ControlPanel:
             _done[0] = True
             self._confirm_rename(tile_id, entry.get(), edit_widgets)
 
+        _bind_entry_keys(entry)
         entry.bind("<Return>", confirm)
+        entry.bind("<KP_Enter>", confirm)
         entry.bind("<FocusOut>", confirm)
         entry.bind("<Escape>", lambda e: confirm())
         check_btn.config(command=confirm)
@@ -1017,6 +1306,8 @@ class ControlPanel:
         entry.pack(padx=18, pady=(0, 6))
         entry.insert(0, "25")
         entry.select_range(0, "end")
+        entry.icursor("end")
+        _bind_entry_keys(entry)
         entry.focus_set()
 
         err = tk.Label(dlg, text="", bg=PANEL_BG, fg="#ff6b6b", font=(_FONT_UI, 9))
@@ -1031,6 +1322,7 @@ class ControlPanel:
                 err.config(text="Invalid format \u2014 try: 25  or  5:30")
 
         entry.bind("<Return>", submit)
+        entry.bind("<KP_Enter>", submit)
         tk.Button(
             dlg, text="Start", bg=PANEL_ACC, fg=PANEL_BG,
             relief="flat", font=(_FONT_UI, 10, "bold"), cursor="hand2",
